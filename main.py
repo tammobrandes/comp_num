@@ -10,8 +10,8 @@ def main():
 
     model_name = "MT"
 
-    for i in range(4):
-        print(f'Training Instance {i+1}/8')
+    for i in range(10):
+        print(f'Training Instance {i+1}/10')
 
         # Get DataLoaders
         train_loader, val_loader, test_loader = get_dataloaders(
