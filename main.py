@@ -4,12 +4,11 @@ from train import train_and_validate
 
 def main():
     # Path to the ZIP file
-    zip_file = 'C:/Users/jiskg/OneDrive/Documenten/MBSC/NCM/dataMiniProject/AltDatasetLarger/AltDatasetLarger.zip'
+    zip_file = '/home/jgroot1/ArithmeticProj/datasets/AltDatasetLarger.zip'
     subfolder_name = 'AltDatasetLarger'  # Subfolder inside the ZIP
     csv_filename = 'dataset.csv'  # Name of the CSV inside the subfolder
 
-    model_name = "MT"
-
+    model_name = "ST_Num"
     for i in range(10):
         print(f'Training Instance {i+1}/10')
 
@@ -18,7 +17,8 @@ def main():
             zip_file=zip_file,
             subfolder_name=subfolder_name,
             csv_filename=csv_filename,
-            batch_size=32
+            batch_size=32,
+            seed = i # Important to get random splits
         )
 
         # Get the model and optimizer
