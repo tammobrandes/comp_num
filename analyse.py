@@ -71,7 +71,7 @@ def main():
                 raise Exception(f'{condition} is not a valid condition!')
         
             # Get DataLoader for the test set
-            train_loader, _, test_loader = get_dataloaders(
+            train_loader, _, test_loader, train_val_loader = get_dataloaders(
                 zip_file=zip_file,
                 subfolder_name=subfolder_name,
                 csv_filename=csv_filename,
@@ -90,13 +90,6 @@ def main():
             csv_save_dir = f'{model_name}_csv'
             os.makedirs(plots_save_dir, exist_ok=True)
             os.makedirs(csv_save_dir, exist_ok=True)
-        
-            # Load training history for plotting
-      #      history_df = pd.read_csv(f'{model_name}_checkpoints/training_history.csv')
-        
-            # Plot and save train/validation losses and accuracies
-     #       plot_train_val_losses(history_df, save_dir)
-     #       plot_train_val_accuracies(history_df, save_dir)
         
             # Compute test accuracy by numerosity and object type
             numerosity_accuracy, object_accuracy,_,_ = compute_accuracy(model_name = model_name, condition = condition, num_softmax = num_softmax, object_softmax = object_softmax, csv_save_dir=csv_save_dir)
@@ -122,24 +115,16 @@ def main():
             layers_to_analyze = [model.conv1, model.conv2, model.conv3, model.conv4, model.conv5, model.conv6]
         
             # Perform the decoding analysis
-            #accuracies, softmax_values, entropy_values, predictions_per_layer, true_labels_per_layer = layer_decoding_analysis(
-            #    model=model, train_dataloader=train_loader, test_dataloader=test_loader, layers=layers_to_analyze, num_classes=16
-            #)
+            layer_decoding_analysis(
+                    model=model,
+                    train_val_loader=train_val_loader, 
+                    test_loader=test_loader,
+                    layers=layers_to_analyze, 
+                    condition=condition,
+                    model_name=model_name,
+                    csv_save_dir=csv_save_dir
+                )
         
-            # Plot decoding accuracy vs. layer
-            #plot_decoding_accuracy_vs_layer(condition=condition, accuracies=accuracies, layers=layers_to_analyze, plots_save_dir=plots_save_dir)
-        
-            # Plot softmax confidence vs. layer
-         #   plot_softmax_confidence_vs_layer(condition=condition, softmax_values=softmax_values, layers=layers_to_analyze, plots_save_dir=plots_save_dir)
-        
-            # Plot entropy vs. numerosity for each layer
-         #   plot_layerwise_entropy_vs_numerosity(condition=condition, entropy_values=entropy_values, num_classes=16, layers=layers_to_analyze, plots_save_dir=plots_save_dir)
-        
-            # Plot confusion matrices for each layer
-           # plot_confusion_matrices_per_layer(condition=condition, predictions_per_layer=predictions_per_layer, true_labels_per_layer=true_labels_per_layer, layers=layers_to_analyze, num_classes=16, csv_save_dir=csv_save_dir, plots_save_dir=plots_save_dir)
-        
-            # Plot softmax distribution for each layer
-            #plot_softmax_values_per_layer(condition=condition, softmax_values=softmax_values, layers=layers_to_analyze, num_numerosities=16, plots_save_dir=plots_save_dir)
         
             # Perform tuning curve analysis for each layer
             for layer_idx, layer in enumerate(layers_to_analyze):

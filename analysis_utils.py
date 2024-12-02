@@ -2,6 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
+from sklearn.svm import SVC
+from scipy.stats import entropy
+import json
+from sklearn.model_selection import KFold
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -38,7 +43,7 @@ def get_softmax_values_and_ground_truth(model, test_loader):
     return num_softmax, object_softmax
 
 # Function to summarize softmax values by numerosity and object type
-def summarize_softmax(softmax_results,):
+def summarize_softmax(softmax_results):
     summary = {}
     for softmax_val, object_type, numerosity in softmax_results:
         if (numerosity, object_type) not in summary:
@@ -171,116 +176,152 @@ def extract_layer_activations(model, layer, inputs):
 
     return activations[0]  # Return the collected activations
 
-def initialize_decoder(model, layer, num_classes):
+def precompute_layer_activations_and_labels_from_dataloader(model, dataloader, layer):
     """
-    Train a linear decoder on the activation maps to classify the numerosities.
-    The decoder will include an AdaptiveAvgPool2d layer before the linear layer.
+    Precompute activations and labels for a specific layer using the provided dataloader,
+    while considering only the second label.
     """
+    activations = []
+    labels = []
 
-    # Define the linear decoder model
-    class Decoder(nn.Module):
-        def __init__(self, input_channels, num_classes):
-            super(Decoder, self).__init__()
-            
-            self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))  # Adaptive average pooling
-            self.fc = nn.Linear(input_channels, num_classes)  # Linear layer for classification
+    for inputs, _, labels in tqdm(dataloader, desc=f"Extracting Activations for Layer {layer}"):
+        layer_activations = extract_layer_activations(model, layer, inputs)
+        activations.append(layer_activations.cpu().numpy())
+        labels.append(labels.numpy())
 
-        def forward(self, x):
-            
-            x = self.avg_pool(x)  # Apply adaptive average pooling            
-            x = torch.flatten(x, 1)  # Flatten to [batch_size, channels]            
-            x = self.fc(x)  # Apply linear layer
-            
-            return x
-    
-    input_channels = layer.out_channels
+    # Concatenate all activations and labels
+    activations = np.concatenate(activations)
+    labels = np.concatenate(labels)
 
-    # Initialize the decoder model
-    decoder = Decoder(input_channels, num_classes)
+    return activations, labels
 
-    # Define loss and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(decoder.parameters(), lr=0.001)
 
-    return decoder, criterion, optimizer
-
-def layer_decoding_analysis(model, train_dataloader, test_dataloader, layers, num_classes):
+def custom_k_fold_with_two_val_folds(dataset_size = 16000, num_folds = 10):
     """
-    Perform decoding analysis for each specified layer in the model in smaller chunks.
-    Returns accuracies, softmax values, entropy for each numerosity class across layers,
-    and predicted/true labels for each layer.
+    Custom splitting function to create train and validation splits
+    with two folds used for validation in each iteration, ensuring exactly 10 splits.
     """
-    accuracies = {numerosity: [[] for _ in range(len(layers))] for numerosity in range(num_classes)}
-    softmax_values = {numerosity: [[] for _ in range(len(layers))] for numerosity in range(num_classes)}
-    entropy_values = {numerosity: [[] for _ in range(len(layers))] for numerosity in range(num_classes)}
-    predictions_per_layer = [[] for _ in range(len(layers))]
-    true_labels_per_layer = [[] for _ in range(len(layers))]
-    
-    device = torch.device('cuda')
-    num_epochs = 10
+    indices = np.arange(dataset_size)
+    fold_size = dataset_size // num_folds
+    folds = [indices[i * fold_size:(i + 1) * fold_size] for i in range(num_folds)]
 
-    # Iterate over the layers with a progress bar
-    for layer_idx, layer in enumerate(tqdm(layers, desc="Analyzing Layers")):
+    splits = []
+
+    # Create 10 splits with 2 folds for validation
+    for i in range(num_folds):
+        val_folds = [folds[i], folds[(i + 1) % num_folds]]  # Use 2 consecutive folds as validation
+        val_indices = np.concatenate(val_folds)
+        train_indices = np.setdiff1d(indices, val_indices)
+        splits.append((train_indices, val_indices))
+
+    return splits
+
+
+def layer_decoding_analysis(
+    model, train_val_loader, test_loader, layers, condition, num_classes = 16, dataset_size = 16000, batch_size=32, model_name="model", csv_save_dir=None
+):
+    """
+    Perform decoding analysis with two folds left out for validation,
+    considering only the second label from the dataset, and compute validation metrics.
+    """
+    label_to_numerosity = {
+        0: 1, 1: 2, 2: 4, 3: 6, 4: 8, 5: 10, 6: 12, 7: 14,
+        8: 16, 9: 18, 10: 20, 11: 22, 12: 24, 13: 26, 14: 28, 15: 30
+    }
+
+    # Custom splits with 2 folds left out for validation
+    splits = custom_k_fold_with_two_val_folds(dataset_size=dataset_size, num_folds=10)
+
+    final_metrics = []
+
+    for layer in tqdm(layers, desc="Processing Layers"):
+        # Precompute activations for the combined train+val set
+        train_val_activations, train_val_labels = precompute_layer_activations_and_labels_from_dataloader(
+            model, train_val_loader, layer
+        )
+
+        # Precompute activations for the test set
+        test_activations, test_labels = precompute_layer_activations_and_labels_from_dataloader(
+            model, test_loader, layer
+        )
+
+        # SVM models and validation results across folds
+        svms = []
+        validation_accuracies = []
+
+        for split_idx, (train_indices, val_indices) in enumerate(tqdm(splits, desc="Custom Splits", leave=False)):
+            # Split the precomputed activations and labels
+            train_activations = train_val_activations[train_indices]
+            train_labels = train_val_labels[train_indices]
+
+            val_activations = train_val_activations[val_indices]
+            val_labels = train_val_labels[val_indices]
+
+            # Train SVM
+            svm = SVC(kernel='linear', probability=True)
+            svm.fit(train_activations, train_labels)
+            svms.append(svm)
+
+            # Evaluate on the validation set
+            val_predictions = svm.predict(val_activations)
+            val_accuracy = accuracy_score(val_labels, val_predictions)
+            validation_accuracies.append(val_accuracy)
+
+        # Model averaging (coefficients and intercepts)
+        avg_coef = np.mean([svm.coef_ for svm in svms], axis=0)
+        avg_intercept = np.mean([svm.intercept_ for svm in svms], axis=0)
+
+        # Create the averaged SVM
+        averaged_svm = SVC(kernel='linear', probability=True)
+        averaged_svm.coef_ = avg_coef
+        averaged_svm.intercept_ = avg_intercept
+
+        # Evaluate on the test set
+        predictions = averaged_svm.predict(test_activations)
+        softmax_outputs = averaged_svm.predict_proba(test_activations)
+
+        # Compute test set metrics
+        accuracy = accuracy_score(test_labels, predictions)
+        conf_matrix = confusion_matrix(test_labels, predictions).tolist()
+        report = classification_report(test_labels, predictions, target_names=[f"Class {i}" for i in range(num_classes)], output_dict=True)
+
+        # Compute per-class metrics like entropy and error
+        entropy_per_class = {}
+        error_per_class = {}
+        for cls in range(num_classes):
+            true_mask = (test_labels == cls)
+            incorrect_mask = (predictions != test_labels) & true_mask
+            predicted_labels_for_class = predictions[incorrect_mask]
+            true_numerosity = label_to_numerosity[cls]
+
+            # Compute entropy
+            class_probs = softmax_outputs[true_mask]
+            class_entropy = np.mean([entropy(prob) for prob in class_probs]) if len(class_probs) > 0 else None
+            entropy_per_class[f"Class {cls}"] = class_entropy
+
+            # Compute error ignoring correct predictions
+            if len(predicted_labels_for_class) > 0:
+                predicted_numerosities = [label_to_numerosity[pred] for pred in predicted_labels_for_class]
+                absolute_errors = [abs(predicted - true_numerosity) for predicted in predicted_numerosities]
+                error_per_class[f"Class {cls}"] = np.mean(absolute_errors)
+            else:
+                error_per_class[f"Class {cls}"] = None
+
+        # Store metrics
+        final_metrics.append({
+            'layer': str(layer),
+            'validation_accuracies': validation_accuracies,
+            'test_accuracy': accuracy,
+            'conf_matrix': conf_matrix,
+            'report': report,
+            'entropy_per_class': entropy_per_class,
+            'error_per_class': error_per_class
+        })
         
-        decoder, criterion, optimizer = initialize_decoder(model = model, layer = layer, num_classes = 16)
-        decoder.to(device)
-        
-        decoder.train()
-        # Extract features for the dataset
-        for e in tqdm(range(num_epochs)):
-            tqdm.set_description(f'Training Decoder: Epoch {e+1}/{num_epochs}')
-            for inputs, _, labels in tqdm(train_dataloader, desc="Epoch Progress", leave=False):
-                optimizer.zero_grad()
-                
-                activations = extract_layer_activations(model, layer, inputs)
-                output = decoder(activations)
-                
-                labels.to(device)
-                
-                loss = criterion(output, labels)
-                
-                loss.backward()
-                optimizer.step()   
+    os.makedirs(csv_save_dir, exist_ok=True)
 
-        # Evaluate the decoder for each numerosity
-        decoder.eval()
-        with torch.no_grad():
-            for inputs, _, labels in tqdm(test_dataloader, desc="Testing Progress", leave=False):
-            
-                activations = extract_layer_activations(model, layer, inputs)
-                output = decoder(activations)
-                
-                labels.to(device)
-            
-                _, predicted = torch.max(output, 1)
-
-            # Collect predictions and true labels for confusion matrix
-                predictions_per_layer[layer_idx].extend(predicted.cpu().numpy())
-                true_labels_per_layer[layer_idx].extend(labels.cpu().numpy())
-
-            # Compute softmax values for confidence
-                outputs_softmax = torch.softmax(output, dim=1)
-
-            # Calculate accuracy, softmax values, and entropy
-                for numerosity in range(num_classes):
-                    mask = labels == numerosity
-                    if mask.sum() > 0:
-                        acc = (predicted[mask] == labels[mask]).float().mean().item()
-                        mean_softmax = outputs_softmax[mask].mean(dim=0).cpu().numpy()
-                        mean_entropy = np.mean([calculate_entropy(p.cpu().numpy()) for p in outputs_softmax[mask]])
-
-                        accuracies[numerosity][layer_idx].append(acc)
-                        softmax_values[numerosity][layer_idx].append(mean_softmax)
-                        entropy_values[numerosity][layer_idx].append(mean_entropy)
-
-    # Average accuracies, softmax values, and entropy across chunks for each layer
-    for numerosity in accuracies:
-        for layer_idx in range(len(layers)):
-            accuracies[numerosity][layer_idx] = np.mean(accuracies[numerosity][layer_idx])
-            softmax_values[numerosity][layer_idx] = np.mean(softmax_values[numerosity][layer_idx], axis=0)
-            entropy_values[numerosity][layer_idx] = np.mean(entropy_values[numerosity][layer_idx])
-
-    return accuracies, softmax_values, entropy_values, predictions_per_layer, true_labels_per_layer
+    with open(os.path.join(csv_save_dir, f"{model_name}{condition}_layer_decoding.json"), "w") as f:
+        json.dump(final_metrics, f, indent=4)
 
 
 def compute_tuning_curves(model, dataloader, layer, num_numerosities, layer_idx, plots_dir, csv_dir):
