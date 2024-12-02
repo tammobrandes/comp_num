@@ -2,7 +2,7 @@ import os
 import pandas as pd
 import zipfile
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, random_split, ConcatDataset
 import torchvision.transforms as transforms
 import torch
 import tempfile
@@ -100,13 +100,17 @@ def get_dataloaders(zip_file, subfolder_name, csv_filename, batch_size=32, seed=
     test_size = total_size - train_size - val_size
     generator = torch.Generator().manual_seed(seed)
     train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size], generator=generator)
+    
+    combined_trainval = ConcatDataset([train_dataset, val_dataset])
 
     # Create DataLoaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    
+    train_val_loader = DataLoader(combined_trainval, batch_size=batch_size, shuffle=True)
 
     print(f"Total dataset size: {total_size}")
     print(f"Train set size: {train_size}, Validation set size: {val_size}, Test set size: {test_size}")
 
-    return train_loader, val_loader, test_loader
+    return train_loader, val_loader, test_loader, train_val_loader
