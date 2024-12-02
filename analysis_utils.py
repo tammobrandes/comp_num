@@ -10,6 +10,12 @@ from collections import defaultdict
 import os
 import gc
 from tqdm import tqdm
+from scipy.stats import pearsonr, spearmanr, shapiro
+from plot_utils import(
+    plot_accuracy_vs_selectivity,
+    plot_kernel_selectivity_histogram,
+    plot_sensitivity, 
+    plot_tuning_curves)
 
 device = torch.device('cuda')
 
@@ -62,7 +68,7 @@ def load_best_model(history_path, model, model_name, optimizer, checkpoints_dir)
     history_df['val_loss_sum'] = history_df['val_loss1'] + history_df['val_loss2']
     best_epoch = history_df['val_loss_sum'].idxmin()
     
-    best_epoch_path = os.path.join(checkpoints_dir, f'{model_name}_epoch_{best_epoch}.pth')
+    best_epoch_path = os.path.join(checkpoints_dir, f'model_epoch_{best_epoch}.pth')
 
     # Load the model from the best epoch checkpoint
     model.load_state_dict(torch.load(best_epoch_path))
@@ -198,7 +204,6 @@ def initialize_decoder(model, layer, num_classes):
 
     return decoder, criterion, optimizer
 
-
 def layer_decoding_analysis(model, train_dataloader, test_dataloader, layers, num_classes):
     """
     Perform decoding analysis for each specified layer in the model in smaller chunks.
@@ -278,97 +283,95 @@ def layer_decoding_analysis(model, train_dataloader, test_dataloader, layers, nu
     return accuracies, softmax_values, entropy_values, predictions_per_layer, true_labels_per_layer
 
 
-def compute_tuning_curves(model, test_dataloader, layer, num_numerosities, layer_idx, plots_save_dir, csv_save_dir):
+def compute_tuning_curves(model, dataloader, layer, num_numerosities, layer_idx, plots_dir, csv_dir):
     """
-    Compute and plot the tuning curves for each kernel in a specific layer, showing the average
-    response (activation) to different numerosities.
+    Compute tuning curves for a given layer and save them as plots and CSV files,
+    including summary statistics like standard deviation and variance.
 
     Args:
-        model (nn.Module): The trained model.
-        dataloader (DataLoader): The DataLoader for the dataset.
-        layer (nn.Module): The layer from which to extract the feature maps.
-        num_numerosities (int): The number of different numerosities.
-        layer_idx (int): The index of the layer being analyzed.
-        save_dir (str): The directory to save the plots.
+        model (nn.Module): Trained model.
+        dataloader (DataLoader): DataLoader for the test set.
+        layer (nn.Module): The layer to analyze.
+        num_numerosities (int): Number of numerosities.
+        layer_idx (int): Index of the layer.
+        plots_dir (str): Directory to save tuning curve plots.
+        csv_dir (str): Directory to save tuning curve data as CSV.
+
+    Returns:
+        None
     """
+    os.makedirs(plots_dir, exist_ok=True)
+    os.makedirs(csv_dir, exist_ok=True)
     
-    device = torch.device('cuda')
-    
-    # Create a directory for the tuning curves
-    layer_save_dir = os.path.join(plots_save_dir, f'tuning_curves/layer_{layer_idx}')
-    os.makedirs(layer_save_dir, exist_ok=True)
-    model.eval()
-
-    # Get the number of output channels (kernels) from the layer
-    num_kernels = layer.out_channels
-
-    # Initialize the tuning curves dictionary with an empty list for each kernel
-    tuning_curves = {kernel_idx: [0] * num_numerosities for kernel_idx in range(num_kernels)}
+    # Initialize storage for tuning curves and statistics
+    tuning_curves = {kernel_idx: np.zeros(num_numerosities) for kernel_idx in range(layer.out_channels)}
+    all_kernel_activations = {kernel_idx: [[] for _ in range(num_numerosities)] for kernel_idx in range(layer.out_channels)}
     counts = np.zeros(num_numerosities)
 
-    # Extract activations for each input
     with torch.no_grad():
-        for inputs, _, labels in tqdm(test_dataloader, desc = f'Extracting Feature Maps for Layer {layer_idx}'):
-            
-            inputs = inputs.to(device)
-            
-            # Forward pass to get feature maps using the extract_layer_activations function
-            
+        for inputs, _, labels in dataloader:
             feature_maps = extract_layer_activations(model, layer, inputs)
-
-            # Average pooling over spatial dimensions
-            avg_feature_maps = feature_maps.mean(dim=[2, 3])  # Shape: [batch_size, num_kernels]
-
-            # Update tuning curves for each numerosity
+            avg_feature_maps = feature_maps.mean(dim=[2, 3])
+            
             for i in range(len(labels)):
                 numerosity = labels[i].item()
-
-                # Iterate over each kernel and add its mean activation to the corresponding numerosity list
-                for kernel_idx in range(num_kernels):
-                    tuning_curves[kernel_idx][numerosity] += avg_feature_maps[i, kernel_idx].cpu().item()
-
+                for kernel_idx in range(layer.out_channels):
+                    tuning_curves[kernel_idx][numerosity] += avg_feature_maps[i, kernel_idx].item()
+                    all_kernel_activations[kernel_idx][numerosity].append(avg_feature_maps[i, kernel_idx].item())
                 counts[numerosity] += 1
-                
-
-    # Normalize the tuning curves by dividing each kernel's response by the counts for each numerosity
-    for kernel_idx in range(num_kernels):
-        for numerosity in range(num_numerosities):
-            if counts[numerosity] > 0:  # Avoid division by zero
+    
+    # Normalize tuning curves
+    for numerosity in range(num_numerosities):
+        if counts[numerosity] > 0:
+            for kernel_idx in range(layer.out_channels):
                 tuning_curves[kernel_idx][numerosity] /= counts[numerosity]
 
-    # Plot tuning curves for each kernel
-    plot_tuning_curves(tuning_curves, num_numerosities, layer_save_dir)
+    # Initialize summary statistics arrays
+    summary_stats = {
+        'mean': np.zeros((layer.out_channels, num_numerosities)),
+        'std': np.zeros((layer.out_channels, num_numerosities)),
+        'variance': np.zeros((layer.out_channels, num_numerosities)),
+        'min': np.zeros((layer.out_channels, num_numerosities)),
+        'max': np.zeros((layer.out_channels, num_numerosities))
+    }
     
-    # Save the tuning curves as a CSV
-    csv_path = os.path.join(csv_save_dir, f'tuning_curves_layer_{layer_idx}.csv')
-    save_tuning_curves_as_csv(tuning_curves, csv_path)
+    # Calculate summary statistics (mean, std, variance)
+    for kernel_idx in range(layer.out_channels):
+        for numerosity in range(num_numerosities):
+            activations = np.array(all_kernel_activations[kernel_idx][numerosity])
+            if len(activations) > 0:
+                summary_stats['mean'][kernel_idx, numerosity] = np.mean(activations)
+                summary_stats['std'][kernel_idx, numerosity] = np.std(activations)
+                summary_stats['variance'][kernel_idx, numerosity] = np.var(activations)
+                summary_stats['min'][kernel_idx, numerosity] = np.min(activations)
+                summary_stats['max'][kernel_idx, numerosity] = np.max(activations)
+
+    # Prepare data for CSV: column-wise
+    csv_data = []
+    for kernel_idx in range(layer.out_channels):
+        for numerosity in range(num_numerosities):
+            row = [
+                kernel_idx,  # Kernel ID
+                numerosity,  # Numerosity
+                summary_stats['mean'][kernel_idx, numerosity],  # Mean
+                summary_stats['std'][kernel_idx, numerosity],  # Std
+                summary_stats['variance'][kernel_idx, numerosity],  # Variance
+                summary_stats['min'][kernel_idx, numerosity],  # Min
+                summary_stats['max'][kernel_idx, numerosity]   # Max
+            ]
+            csv_data.append(row)
+    
+    # Convert to DataFrame and save as CSV
+    csv_path = os.path.join(csv_dir, f'tuning_curves_and_stats_layer_{layer_idx}.csv')
+    csv_df = pd.DataFrame(csv_data, columns=['kernel id', 'numerosity', 'mean', 'std', 'variance', 'min', 'max'])
+    csv_df.to_csv(csv_path, index=False)
+    print(f'Saved tuning curves and summary statistics for layer {layer_idx} to {csv_path}')
+    
+    # Plot tuning curves (you can leave this part unchanged if it works as expected)
+    plot_tuning_curves(tuning_curves, num_numerosities, plots_dir)
 
 
-def plot_tuning_curves(tuning_curves, num_numerosities, layer_save_dir):
-    """
-    Plot tuning curves for each kernel and save them in the layer directory.
 
-    Args:
-        tuning_curves (dict): Dictionary containing tuning curve data for each kernel.
-        num_numerosities (int): The number of different numerosities.
-        layer_save_dir (str): The directory to save the plots for the current layer.
-    """
-    # Ensure the directory for the current layer exists
-    os.makedirs(layer_save_dir, exist_ok=True)
-
-    for kernel_idx, curve in tuning_curves.items():
-        # Plot the tuning curve for the current kernel
-        plt.figure()
-        plt.plot(range(num_numerosities), curve, marker='o')
-        plt.xlabel('Numerosity')
-        plt.ylabel('Average Activation')
-        plt.title(f'Tuning Curve for Kernel {kernel_idx}')
-        plt.grid()
-        plt.tight_layout()
-
-        # Save the plot in the current layer's directory
-        plt.savefig(os.path.join(layer_save_dir, f'ST_Num_tuning_curve_kernel_{kernel_idx}.png'))
-        plt.close()
         
 def save_tuning_curves_as_csv(tuning_curves, file_path):
     """
@@ -389,93 +392,162 @@ def save_tuning_curves_as_csv(tuning_curves, file_path):
 
 
 
-def compute_selectivity_index_and_save_csv(model, dataloader, layers, num_numerosities=16, save_dir='selectivity_indices'):
+def compute_selectivity_index_and_save_csv(model, model_name, dataloader, condition, layers, num_numerosities, save_dir):
     """
-    Compute the selectivity index (Swidth) for each kernel in each layer and save the results as CSV files.
+    Compute the selectivity index for all kernels in given layers and save as CSV.
 
     Args:
         model (nn.Module): The trained model.
-        dataloader (DataLoader): The DataLoader for the dataset.
-        layers (list): The list of layers to analyze.
-        num_numerosities (int): The number of different numerosities.
-        save_dir (str): The directory where the CSV files will be saved.
+        model_name (str): Name of the model.
+        dataloader (DataLoader): DataLoader for the dataset.
+        condition (str): Experimental condition (e.g., '', '_samesize', '_ood').
+        layers (list): List of layers to analyze.
+        num_numerosities (int): Number of numerosities.
+        save_dir (str): Directory to save CSV files.
 
     Returns:
-        selectivity_indices (dict): A dictionary containing the selectivity index for each kernel in each layer.
+        None
     """
-    os.makedirs(save_dir, exist_ok=True)  # Ensure the save directory exists
-    selectivity_indices = {}
-
-    # Loop over layers
+    os.makedirs(save_dir, exist_ok=True)
+    dataset_name = 'Base' if condition == '' else ('SameSize' if condition == '_samesize' else 'OOD')
+    
     for layer_idx, layer in enumerate(layers):
         print(f"Analyzing layer {layer_idx}")
-        num_kernels = layer.out_channels  # Get the number of kernels in the layer
-
-        # Initialize data structures
-        tuning_curves = {kernel_idx: np.zeros(num_numerosities) for kernel_idx in range(num_kernels)}
+        tuning_curves = {kernel_idx: np.zeros(num_numerosities) for kernel_idx in range(layer.out_channels)}
         counts = np.zeros(num_numerosities)
 
-        # Extract activations for each input
         with torch.no_grad():
-            for inputs, _, labels in tqdm(dataloader, desc=f'Extracting Feature Maps for Layer {layer_idx}'):
+            for inputs, _, labels in dataloader:
                 feature_maps = extract_layer_activations(model, layer, inputs)
-
-                # Average pooling over spatial dimensions to get [batch_size, num_kernels]
                 avg_feature_maps = feature_maps.mean(dim=[2, 3])
-
-                # Update tuning curves for each numerosity
+                
                 for i in range(len(labels)):
                     numerosity = labels[i].item()
-
-                    # Iterate over each kernel and add its mean activation to the corresponding numerosity list
-                    for kernel_idx in range(num_kernels):
+                    for kernel_idx in range(layer.out_channels):
                         tuning_curves[kernel_idx][numerosity] += avg_feature_maps[i, kernel_idx].item()
-
-                    # Track how many times each numerosity appears
                     counts[numerosity] += 1
-
-        # Normalize tuning curves by the counts of each numerosity
+        
+        # Normalize tuning curves
         for numerosity in range(num_numerosities):
             if counts[numerosity] > 0:
-                for kernel_idx in range(num_kernels):
+                for kernel_idx in range(layer.out_channels):
                     tuning_curves[kernel_idx][numerosity] /= counts[numerosity]
 
-        # Compute the selectivity index for each kernel
+        # Compute selectivity index
         layer_selectivity_indices = []
         layer_numerosity_preferences = []
-        for kernel_idx in range(num_kernels):
-
+        for kernel_idx in range(layer.out_channels):
             responses = tuning_curves[kernel_idx]
-            
-            responses_tensor = torch.tensor(responses)
-
-            # Find r_max (maximum response of the kernel across all numerosities)
-            r_max, max_idx = torch.max(responses_tensor, dim=0)
-            max_idx = int(max_idx.item())  # Ensure max_idx is an integer
-
-            mapping = {0:1, 1:2, 2:4, 3:6, 4:8, 5:10, 6:12, 7:14, 8:16, 9:18, 10:20, 11:22, 12:24, 13:26, 14:28, 15:30}
-
-            # Compute the selectivity index using the formula
-            if r_max > 0:  # Avoid division by zero
-                sum_responses = np.sum(responses)
-                selectivity_index = (num_numerosities - (sum_responses / float(r_max))) / (num_numerosities - 1)
-                numerosity_preference = mapping[int(max_idx)]
-            else:
-                selectivity_index = 0  # If the kernel has no response, set selectivity to 0
-                numerosity_preference = None
-
-            # Store the selectivity index for this kernel
+            r_max = max(responses)
+            selectivity_index = (num_numerosities - sum(responses) / r_max) / (num_numerosities - 1) if r_max > 0 else 0
+            numerosity_preference = np.argmax(responses)
             layer_selectivity_indices.append(selectivity_index)
             layer_numerosity_preferences.append(numerosity_preference)
-
-        # Save the selectivity indices for this layer as a CSV file
-        df = pd.DataFrame(layer_selectivity_indices, columns=[f'Layer_{layer_idx}_Selectivity_Index'])
-        df[f'Layer_{layer_idx}_Numerosity_Preference'] = pd.DataFrame(layer_numerosity_preferences)
-        csv_path = os.path.join(save_dir, f'MT_selectivity_indices_layer_{layer_idx}_ood.csv')
+        
+        # Save to CSV
+        df = pd.DataFrame({
+            'Selectivity_Index': layer_selectivity_indices,
+            'Numerosity_Preference': layer_numerosity_preferences,
+            'Layer': layer_idx,
+            'Dataset': dataset_name
+        })
+        csv_path = os.path.join(save_dir, f'{model_name}_selectivity_indices_layer_{layer_idx}_{dataset_name}.csv')
         df.to_csv(csv_path, index_label='Kernel_Index')
-        print(f'Saved selectivity indices for Layer {layer_idx} to {csv_path}')
+        print(f"Saved selectivity indices for layer {layer_idx} to {csv_path}")
 
-        # Store in selectivity_indices dictionary for later use
-        selectivity_indices[layer_idx] = layer_selectivity_indices
 
-    return selectivity_indices
+def estimate_correlation(model_name, dataset_name, data_path):
+    """
+    Estimates the correlation between the percentage of selective neurons and model accuracy for the specified model and dataset.
+    Performs a normality test and uses Pearson or Spearman correlation accordingly, returning the correlation coefficient, p-value, and test used.
+    Also returns p-values from the normality test for both variables.
+    
+    Parameters:
+    - model_name (str): Name of the model ('MT', 'ST_Num', 'ST_Obj')
+    - dataset_name (str or None): Name of the dataset to filter ('base', 'ood', 'ss'). If None, all datasets will be used.
+    - data_path (str): Path to the directory containing the CSV files.
+    
+    Returns:
+    - correlations (dict): Dictionary with dataset names as keys and the correlation results as values (correlation, p-value, test used, normality p-values).
+    """
+    
+    # Mapping of dataset names to actual file naming conventions
+    dataset_mapping = {
+        'base': 'base',
+        'ood': 'AltDatasetOOD',
+        'ss': 'AltDatasetLarger_SameSize'
+    }
+    
+    # If dataset_name is provided, filter to only that dataset, otherwise use all
+    if dataset_name:
+        dataset_names = [dataset_mapping[dataset_name]]
+    else:
+        dataset_names = dataset_mapping.values()
+
+    # Initialize dictionary to store correlations
+    correlations = {}
+
+    # Loop through each dataset
+    for dataset in dataset_names:
+        file_name = f"numerosity_accuracy_model_{model_name}_{dataset}.csv"
+        file_path = os.path.join(data_path, file_name)
+
+        # Check if the file exists
+        if not os.path.isfile(file_path):
+            print(f"File not found: {file_path}")
+            continue
+        
+        # Load the dataset
+        df = pd.read_csv(file_path)
+        
+        # The first column is the number of selective neurons, unnamed
+        num_selective_neurons = df['Kernel_Count']
+        
+        # The 'accuracy' column contains model accuracies
+        accuracies = df['Accuracy']
+        
+        # Calculate the percentage of selective neurons (out of total neurons)
+        total_neurons = num_selective_neurons.sum()
+        percentage_selective_neurons = num_selective_neurons 
+        
+        # Perform normality tests (Shapiro-Wilk test)
+        stat_neurons, p_value_neurons = shapiro(percentage_selective_neurons)
+        stat_accuracy, p_value_accuracy = shapiro(accuracies)
+        
+        # Use Pearson if both datasets are normally distributed, otherwise use Spearman
+        if p_value_neurons > 0.05 and p_value_accuracy > 0.05:
+            # Normally distributed, use Pearson correlation
+            correlation, p_value_corr = pearsonr(percentage_selective_neurons, accuracies)
+            test_used = 'Pearson'
+        else:
+            # Not normally distributed, use Spearman correlation
+            correlation, p_value_corr = spearmanr(percentage_selective_neurons, accuracies)
+            test_used = 'Spearman'
+        
+        # Store the result in the dictionary with correlation, p-value, test used, and normality p-values
+        correlations[dataset] = {
+            'correlation': correlation,
+            'p_value_corr': p_value_corr,
+            'test_used': test_used,
+            'normality_p_value_neurons': p_value_neurons,
+            'normality_p_value_accuracy': p_value_accuracy
+        }
+    
+    return correlations
+
+def compute_acc_sel_corr(sel_thr1, sel_thr2, numerosity_accuracy,model_name, dataset_name, csv_dir, plot_dir):
+    # Should be changed to extract from save file
+    df_sel_index = pd.read_csv(os.path.join(csv_dir, f'{model_name}_final_concatenated_selectivity_indices.csv'))
+    df_numerosities = pd.read_csv(os.path.join(csv_dir,f'{model_name}_numerosity_accuracies.csv'))
+    num_accuracies = df_numerosities['accuracy']
+    if dataset_name == '_samesize':
+        dataset = 'ss'
+    elif dataset_name == '_ood':
+        dataset = 'ood'
+    else:
+        dataset = 'base'
+    plot_accuracy_vs_selectivity(numerosity_accuracy, df_sel_index, dataset, sel_thr1, sel_thr2, plot_dir, model_name)
+    plot_kernel_selectivity_histogram(df_sel_index, dataset,5, sel_thr1, sel_thr2,plot_dir, model_name, num_accuracies)
+    plot_sensitivity(plot_dir)
+    correlations = estimate_correlation('MT', 'base', os.path.join(csv_dir, 'num_accuracies'))
+    print(correlations)

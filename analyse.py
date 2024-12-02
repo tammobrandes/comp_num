@@ -25,14 +25,15 @@ from plot_utils import (
     plot_softmax_confidence_vs_layer,
     plot_layerwise_entropy_vs_numerosity,
     plot_confusion_matrices_per_layer,
-    plot_softmax_values_per_layer
+    plot_softmax_values_per_layer,
+    plot_tuning_curves
 )
 
 def main():
     
-    conditions = ['', '_samesize', '_ood']
-    N = 10
-    
+    conditions = ['','_samesize']#['', '_samesize', '_ood']
+    N = 1#10
+    print(f'Assessing Instance {1}/{N}')
     for i in range(N):
         
         for condition in conditions:
@@ -50,24 +51,33 @@ def main():
         
             if condition == '':
                 # Change depending on dataset
-                csv_file = '/Users/tammo/Desktop/Project/AltDatasetLarger/dataset.csv'
-                img_dir = '/Users/tammo/Desktop/Project/AltDatasetLarger'
+                zip_file = '/home/jgroot1/ArithmeticProj/datasets/AltDatasetLarger.zip'
+                subfolder_name = 'AltDatasetLarger'  # Subfolder inside the ZIP
+                csv_filename = 'dataset.csv'  # Name of the CSV inside the subfolder
             
             elif condition == '_samesize':
                 # Change depending on dataset
-                csv_file = '/Users/tammo/Desktop/Project/AltDatasetLarger_SameSize/dataset.csv'
-                img_dir = '/Users/tammo/Desktop/Project/AltDatasetLarger_SameSize'
+                zip_file = '/home/jgroot1/ArithmeticProj/datasets/AltDatasetLarger_SameSize.zip'
+                subfolder_name = 'AltDatasetLarger_SameSize'  # Subfolder inside the ZIP
+                csv_filename = 'dataset.csv'  # Name of the CSV inside the subfolder
                 
             elif condition == '_ood':
                 # Change depending on dataset
-                csv_file = '/Users/tammo/Desktop/Project/AltDatasetLarger/dataset.csv'
-                img_dir = '/Users/tammo/Desktop/Project/AltDatasetLarger'
+                zip_file = '/home/jgroot1/ArithmeticProj/datasets/AltDatasetOOD.zip'
+                subfolder_name = 'AltDatasetOOD'  # Subfolder inside the ZIP
+                csv_filename = 'dataset.csv'  # Name of the CSV inside the subfolder
                 
             else:
                 raise Exception(f'{condition} is not a valid condition!')
         
             # Get DataLoader for the test set
-            train_loader, _, test_loader = get_dataloaders(csv_file, img_dir, batch_size=32)
+            train_loader, _, test_loader = get_dataloaders(
+                zip_file=zip_file,
+                subfolder_name=subfolder_name,
+                csv_filename=csv_filename,
+                batch_size=32,
+                seed = i # Important to get random splits
+            )
         
             # Get softmax results and ground truth from the test set
             num_softmax, object_softmax = get_softmax_values_and_ground_truth(model, test_loader)
@@ -112,12 +122,12 @@ def main():
             layers_to_analyze = [model.conv1, model.conv2, model.conv3, model.conv4, model.conv5, model.conv6]
         
             # Perform the decoding analysis
-            accuracies, softmax_values, entropy_values, predictions_per_layer, true_labels_per_layer = layer_decoding_analysis(
-                model=model, train_loader=train_loader, test_loader=test_loader, layers=layers_to_analyze, num_classes=16
-            )
+            #accuracies, softmax_values, entropy_values, predictions_per_layer, true_labels_per_layer = layer_decoding_analysis(
+            #    model=model, train_dataloader=train_loader, test_dataloader=test_loader, layers=layers_to_analyze, num_classes=16
+            #)
         
             # Plot decoding accuracy vs. layer
-            plot_decoding_accuracy_vs_layer(condition=condition, accuracies=accuracies, layers=layers_to_analyze, plots_save_dir=plots_save_dir)
+            #plot_decoding_accuracy_vs_layer(condition=condition, accuracies=accuracies, layers=layers_to_analyze, plots_save_dir=plots_save_dir)
         
             # Plot softmax confidence vs. layer
          #   plot_softmax_confidence_vs_layer(condition=condition, softmax_values=softmax_values, layers=layers_to_analyze, plots_save_dir=plots_save_dir)
@@ -126,23 +136,37 @@ def main():
          #   plot_layerwise_entropy_vs_numerosity(condition=condition, entropy_values=entropy_values, num_classes=16, layers=layers_to_analyze, plots_save_dir=plots_save_dir)
         
             # Plot confusion matrices for each layer
-            plot_confusion_matrices_per_layer(condition=condition, predictions_per_layer=predictions_per_layer, true_labels_per_layer=true_labels_per_layer, layers=layers_to_analyze, num_classes=16, csv_save_dir=csv_save_dir, plots_save_dir=plots_save_dir)
+           # plot_confusion_matrices_per_layer(condition=condition, predictions_per_layer=predictions_per_layer, true_labels_per_layer=true_labels_per_layer, layers=layers_to_analyze, num_classes=16, csv_save_dir=csv_save_dir, plots_save_dir=plots_save_dir)
         
             # Plot softmax distribution for each layer
-            plot_softmax_values_per_layer(condition=condition, softmax_values=softmax_values, layers=layers_to_analyze, num_numerosities=16, plots_save_dir=plots_save_dir)
+            #plot_softmax_values_per_layer(condition=condition, softmax_values=softmax_values, layers=layers_to_analyze, num_numerosities=16, plots_save_dir=plots_save_dir)
         
             # Perform tuning curve analysis for each layer
-            
-            
             for layer_idx, layer in enumerate(layers_to_analyze):
-                compute_tuning_curves(model, test_loader, layer, num_numerosities=16, layer_idx=layer_idx, plots_save_dir=plots_save_dir, csv_save_dir=csv_save_dir)
-        
-         #   print(f"Plots saved in {save_dir}.")
-        
-            # Example usage of the function
-            selectivity_indices = compute_selectivity_index_and_save_csv(model, test_loader, layers_to_analyze, num_numerosities=16, save_dir=f'{model_name}_selectivity_indices')
+                compute_tuning_curves(
+                    model=model,
+                    dataloader=test_loader,
+                    layer=layer,
+                    num_numerosities=16,
+                    layer_idx=layer_idx,
+                    plots_dir=os.path.join(plots_save_dir, f'tuning_curves/layer_{layer_idx}'),
+                    csv_dir=os.path.join(csv_save_dir, 'tuning_curves')
+                )
 
-
+            # Compute selectivity index
+            compute_selectivity_index_and_save_csv(
+                model=model,
+                model_name=model_name,
+                dataloader=test_loader,
+                condition=condition,
+                layers=layers_to_analyze,
+                num_numerosities=16,
+                save_dir=os.path.join(csv_save_dir, 'selectivity_index')
+            )
+            
+            #sel_thr1 = 0.3
+            #sel_thr2 = 0.6
+            #compute_acc_sel_corr(sel_thr1, sel_thr2, numerosity_accuracy,model_name, condition, csv_dir,os.path.join(plots_save_dir, 'acc_sel_corr'))
 
 if __name__ == "__main__":
     main()
