@@ -229,7 +229,9 @@ def train_nn_decoder(model, train_loader, val_loader, layer, num_classes, input_
     if input_dim is None:
         sample_inputs, _, _ = next(iter(train_loader))
         sample_activations = extract_layer_activations(model, layer, sample_inputs)
-        input_dim = np.prod(sample_activations.shape[1:])  # Flatten all dimensions except batch_size
+        sample_activations = torch.tensor(sample_activations, dtype=torch.float32)  # Convert to tensor
+        pooled_activations = nn.AdaptiveAvgPool2d((1, 1))(sample_activations)  # Apply GAP
+        input_dim = pooled_activations.shape[1]  # The number of channels after GAP
 
     print(f"Determined input_dim: {input_dim}")
 
@@ -246,7 +248,7 @@ def train_nn_decoder(model, train_loader, val_loader, layer, num_classes, input_
         for inputs, _, labels in train_loader:
             # Extract layer activations
             activations = extract_layer_activations(model, layer, inputs)
-            activations = torch.tensor(activations, dtype=torch.float32).view(len(inputs), -1).to(device)
+            activations = torch.tensor(activations, dtype=torch.float32).to(device) # .view(len(inputs), -1)
             labels = labels.to(device)
 
             # Train the decoder
@@ -266,7 +268,7 @@ def train_nn_decoder(model, train_loader, val_loader, layer, num_classes, input_
     with torch.no_grad():
         for inputs, _, labels in val_loader:
             activations = extract_layer_activations(model, layer, inputs)
-            activations = torch.tensor(activations, dtype=torch.float32).view(len(inputs), -1).to(device)
+            activations = torch.tensor(activations, dtype=torch.float32).to(device) # .view(len(inputs), -1)
 
             outputs = decoder(activations)
             predictions.extend(torch.argmax(outputs, axis=1).cpu().numpy())
@@ -379,7 +381,7 @@ def compute_tuning_curves(model, dataloader, layer, num_numerosities, layer_idx,
     with torch.no_grad():
         for inputs, _, labels in dataloader:
             feature_maps = extract_layer_activations(model, layer, inputs)
-            avg_feature_maps = feature_maps.mean(dim=[2, 3])
+            avg_feature_maps = feature_maps.mean(2).mean(2)
             
             for i in range(len(labels)):
                 numerosity = labels[i].item()
@@ -387,6 +389,7 @@ def compute_tuning_curves(model, dataloader, layer, num_numerosities, layer_idx,
                     tuning_curves[kernel_idx][numerosity] += avg_feature_maps[i, kernel_idx].item()
                     all_kernel_activations[kernel_idx][numerosity].append(avg_feature_maps[i, kernel_idx].item())
                 counts[numerosity] += 1
+
     
     # Normalize tuning curves
     for numerosity in range(num_numerosities):
@@ -487,7 +490,7 @@ def compute_selectivity_index_and_save_csv(model, model_name, dataloader, condit
         with torch.no_grad():
             for inputs, _, labels in dataloader:
                 feature_maps = extract_layer_activations(model, layer, inputs)
-                avg_feature_maps = feature_maps.mean(dim=[2, 3])
+                avg_feature_maps = feature_maps.mean(2).mean(2)
                 
                 for i in range(len(labels)):
                     numerosity = labels[i].item()

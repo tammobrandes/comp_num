@@ -51,20 +51,20 @@ def main():
         
             if condition == '':
                 # Change depending on dataset
-                zip_file = '/home/tbrandes/ArithmeticProj/datasets/AltDatasetLarger.zip'
+                zip_file = '/home/jgroot1/ArithmeticProj/datasets/AltDatasetLarger.zip'
                 subfolder_name = 'AltDatasetLarger'  # Subfolder inside the ZIP
                 csv_filename = 'dataset.csv'  # Name of the CSV inside the subfolder
             
             elif condition == '_samesize':
                 # Change depending on dataset
-                zip_file = '/home/tbrandes/ArithmeticProj/datasets/AltDatasetLarger_SameSize.zip'
+                zip_file = '/home/jgroot1/ArithmeticProj/datasets/AltDatasetLarger_SameSize.zip'
                 subfolder_name = 'AltDatasetLarger_SameSize'  # Subfolder inside the ZIP
                 csv_filename = 'dataset.csv'  # Name of the CSV inside the subfolder
                 
             elif condition == '_ood':
                 # Change depending on dataset
-                zip_file = '/home/tbrandes/ArithmeticProj/datasets/AltDatasetOOD.zip'
-                subfolder_name = 'AltDatasetLarger_OOD'  # Subfolder inside the ZIP
+                zip_file = '/home/jgroot1/ArithmeticProj/datasets/AltDatasetOOD.zip'
+                subfolder_name = 'AltDatasetOOD'  # Subfolder inside the ZIP
                 csv_filename = 'dataset.csv'  # Name of the CSV inside the subfolder
                 
             else:
