@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.data import DataLoader, random_split
 from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
-from sklearn.svm import SVC
 from scipy.stats import entropy
 import json
 from sklearn.model_selection import KFold
@@ -157,171 +157,198 @@ def calculate_entropy(softmax_values):
 
 def extract_layer_activations(model, layer, inputs):
     """
-    Extract activation maps from a specified layer in the model.
+    Extract activation maps from a specified layer in the model without applying global average pooling.
     """
-    activations = []
-    device = torch.device('cuda')
+    activations = None  # To reduce memory overhead
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
-    
+
     def hook_fn(module, input, output):
-        activations.append(F.relu(output).detach().clone())
+        nonlocal activations
+        activations = output.detach().cpu().numpy()  # Store the raw activations
 
     handle = layer.register_forward_hook(hook_fn)
-    
-    inputs = inputs.to(device)
 
-    model(inputs)  # Perform a forward pass to collect the activations
+    inputs = inputs.to(device)
+    with torch.no_grad():
+        model(inputs)  # Perform a forward pass to collect the activations
 
     handle.remove()
+    return activations
 
-    return activations[0]  # Return the collected activations
 
-def precompute_layer_activations_and_labels_from_dataloader(model, dataloader, layer):
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, random_split
+import numpy as np
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from scipy.stats import entropy
+import os
+
+def split_test_loader(test_dataset, batch_size=32):
     """
-    Precompute activations and labels for a specific layer using the provided dataloader,
-    while considering only the second label.
+    Split the test dataset into 80% training and 20% validation subsets.
     """
-    activations = []
-    labels = []
+    total_size = len(test_dataset)
+    train_size = int(0.8 * total_size)
+    val_size = total_size - train_size
 
-    for inputs, _, labels in tqdm(dataloader, desc=f"Extracting Activations for Layer {layer}"):
-        layer_activations = extract_layer_activations(model, layer, inputs)
-        activations.append(layer_activations.cpu().numpy())
-        labels.append(labels.numpy())
+    train_subset, val_subset = random_split(test_dataset, [train_size, val_size])
 
-    # Concatenate all activations and labels
-    activations = np.concatenate(activations)
-    labels = np.concatenate(labels)
+    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
 
-    return activations, labels
+    return train_loader, val_loader
 
 
-def custom_k_fold_with_two_val_folds(dataset_size = 16000, num_folds = 10):
+class SingleLayerNN(nn.Module):
     """
-    Custom splitting function to create train and validation splits
-    with two folds used for validation in each iteration, ensuring exactly 10 splits.
+    Single-layer neural network with global average pooling for classification.
     """
-    indices = np.arange(dataset_size)
-    fold_size = dataset_size // num_folds
-    folds = [indices[i * fold_size:(i + 1) * fold_size] for i in range(num_folds)]
+    def __init__(self, input_channels, num_classes):
+        super(SingleLayerNN, self).__init__()
+        self.global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))  # GAP layer
+        self.fc = nn.Linear(input_channels, num_classes)  # Fully connected layer
 
-    splits = []
+    def forward(self, x):
+        x = self.global_avg_pool(x)  # Apply GAP
+        x = x.view(x.size(0), -1)   # Flatten for the FC layer
+        return self.fc(x)          # Apply the FC layer
 
-    # Create 10 splits with 2 folds for validation
-    for i in range(num_folds):
-        val_folds = [folds[i], folds[(i + 1) % num_folds]]  # Use 2 consecutive folds as validation
-        val_indices = np.concatenate(val_folds)
-        train_indices = np.setdiff1d(indices, val_indices)
-        splits.append((train_indices, val_indices))
 
-    return splits
+def train_nn_decoder(model, train_loader, val_loader, layer, num_classes, input_dim=None, epochs=10, lr=1e-3):
+    """
+    Train the NN decoder directly from the extracted layer activations.
+    Automatically determines input_dim if not provided.
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Dynamically determine input_dim from activations
+    if input_dim is None:
+        sample_inputs, _, _ = next(iter(train_loader))
+        sample_activations = extract_layer_activations(model, layer, sample_inputs)
+        input_dim = np.prod(sample_activations.shape[1:])  # Flatten all dimensions except batch_size
+
+    print(f"Determined input_dim: {input_dim}")
+
+    # Initialize the decoder
+    decoder = SingleLayerNN(input_dim, num_classes).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(decoder.parameters(), lr=lr)
+
+    # Training loop
+    for epoch in range(epochs):
+        decoder.train()
+        epoch_loss = 0.0
+
+        for inputs, _, labels in train_loader:
+            # Extract layer activations
+            activations = extract_layer_activations(model, layer, inputs)
+            activations = torch.tensor(activations, dtype=torch.float32).view(len(inputs), -1).to(device)
+            labels = labels.to(device)
+
+            # Train the decoder
+            optimizer.zero_grad()
+            outputs = decoder(activations)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {epoch_loss:.4f}", end="\r")
+
+    # Validation
+    decoder.eval()
+    predictions, softmax_outputs, val_labels = [], [], []
+    with torch.no_grad():
+        for inputs, _, labels in val_loader:
+            activations = extract_layer_activations(model, layer, inputs)
+            activations = torch.tensor(activations, dtype=torch.float32).view(len(inputs), -1).to(device)
+
+            outputs = decoder(activations)
+            predictions.extend(torch.argmax(outputs, axis=1).cpu().numpy())
+            softmax_outputs.extend(torch.softmax(outputs, dim=1).cpu().numpy())
+            val_labels.extend(labels.numpy())
+
+    return predictions, softmax_outputs, val_labels, decoder
 
 
 def layer_decoding_analysis(
-    model, train_val_loader, test_loader, layers, condition, num_classes = 16, dataset_size = 16000, batch_size=32, model_name="model", csv_save_dir=None
+    model, test_dataset, layers, condition, num_classes=16, batch_size=32,
+    model_name="model", csv_save_dir=None
 ):
     """
-    Perform decoding analysis with two folds left out for validation,
-    considering only the second label from the dataset, and compute validation metrics.
+    Perform decoding analysis by extracting activations from a given layer and training
+    a neural network decoder directly on the extracted activations.
     """
-    label_to_numerosity = {
+    # Split the test_loader dataset
+    train_loader, val_loader = split_test_loader(test_dataset, batch_size=batch_size)
+
+    # Define numerosity mapping
+    numerosity_mapping = {
         0: 1, 1: 2, 2: 4, 3: 6, 4: 8, 5: 10, 6: 12, 7: 14,
         8: 16, 9: 18, 10: 20, 11: 22, 12: 24, 13: 26, 14: 28, 15: 30
     }
 
-    # Custom splits with 2 folds left out for validation
-    splits = custom_k_fold_with_two_val_folds(dataset_size=dataset_size, num_folds=10)
-
     final_metrics = []
 
     for layer in tqdm(layers, desc="Processing Layers"):
-        # Precompute activations for the combined train+val set
-        train_val_activations, train_val_labels = precompute_layer_activations_and_labels_from_dataloader(
-            model, train_val_loader, layer
+        layer_str = str(layer).replace(' ', '_')
+
+        # Train and evaluate the NN decoder
+        predictions, softmax_outputs, val_labels, trained_decoder = train_nn_decoder(
+            model, train_loader, val_loader, layer, num_classes=num_classes, epochs=10, lr=1e-3
         )
 
-        # Precompute activations for the test set
-        test_activations, test_labels = precompute_layer_activations_and_labels_from_dataloader(
-            model, test_loader, layer
-        )
+        # Compute validation metrics
+        accuracy = accuracy_score(val_labels, predictions)
+        conf_matrix = confusion_matrix(val_labels, predictions).tolist()
+        report = classification_report(val_labels, predictions, target_names=[f"Class {i}" for i in range(num_classes)], output_dict=True)
 
-        # SVM models and validation results across folds
-        svms = []
-        validation_accuracies = []
-
-        for split_idx, (train_indices, val_indices) in enumerate(tqdm(splits, desc="Custom Splits", leave=False)):
-            # Split the precomputed activations and labels
-            train_activations = train_val_activations[train_indices]
-            train_labels = train_val_labels[train_indices]
-
-            val_activations = train_val_activations[val_indices]
-            val_labels = train_val_labels[val_indices]
-
-            # Train SVM
-            svm = SVC(kernel='linear', probability=True)
-            svm.fit(train_activations, train_labels)
-            svms.append(svm)
-
-            # Evaluate on the validation set
-            val_predictions = svm.predict(val_activations)
-            val_accuracy = accuracy_score(val_labels, val_predictions)
-            validation_accuracies.append(val_accuracy)
-
-        # Model averaging (coefficients and intercepts)
-        avg_coef = np.mean([svm.coef_ for svm in svms], axis=0)
-        avg_intercept = np.mean([svm.intercept_ for svm in svms], axis=0)
-
-        # Create the averaged SVM
-        averaged_svm = SVC(kernel='linear', probability=True)
-        averaged_svm.coef_ = avg_coef
-        averaged_svm.intercept_ = avg_intercept
-
-        # Evaluate on the test set
-        predictions = averaged_svm.predict(test_activations)
-        softmax_outputs = averaged_svm.predict_proba(test_activations)
-
-        # Compute test set metrics
-        accuracy = accuracy_score(test_labels, predictions)
-        conf_matrix = confusion_matrix(test_labels, predictions).tolist()
-        report = classification_report(test_labels, predictions, target_names=[f"Class {i}" for i in range(num_classes)], output_dict=True)
-
-        # Compute per-class metrics like entropy and error
+        # Per-class entropy
         entropy_per_class = {}
-        error_per_class = {}
         for cls in range(num_classes):
-            true_mask = (test_labels == cls)
-            incorrect_mask = (predictions != test_labels) & true_mask
-            predicted_labels_for_class = predictions[incorrect_mask]
-            true_numerosity = label_to_numerosity[cls]
-
-            # Compute entropy
-            class_probs = softmax_outputs[true_mask]
-            class_entropy = np.mean([entropy(prob) for prob in class_probs]) if len(class_probs) > 0 else None
+            class_mask = (np.array(val_labels) == cls)
+            class_probs = np.array(softmax_outputs)[class_mask]
+            class_entropy = float(np.mean([entropy(prob) for prob in class_probs])) if len(class_probs) > 0 else None
             entropy_per_class[f"Class {cls}"] = class_entropy
 
-            # Compute error ignoring correct predictions
+        # Average error distance per numerosity, ignoring correct predictions
+        error_per_class = {}
+        for cls in range(num_classes):
+            true_mask = (np.array(val_labels) == cls)
+            incorrect_mask = (np.array(predictions) != np.array(val_labels)) & true_mask
+            predicted_labels_for_class = np.array(predictions)[incorrect_mask]
+            true_numerosity = numerosity_mapping[cls]
+
             if len(predicted_labels_for_class) > 0:
-                predicted_numerosities = [label_to_numerosity[pred] for pred in predicted_labels_for_class]
+                predicted_numerosities = [numerosity_mapping[pred] for pred in predicted_labels_for_class]
                 absolute_errors = [abs(predicted - true_numerosity) for predicted in predicted_numerosities]
-                error_per_class[f"Class {cls}"] = np.mean(absolute_errors)
+                average_error = float(np.mean(absolute_errors))
+                error_per_class[f"Class {cls}"] = average_error
             else:
                 error_per_class[f"Class {cls}"] = None
 
-        # Store metrics
+        # Store metrics for this layer
         final_metrics.append({
             'layer': str(layer),
-            'validation_accuracies': validation_accuracies,
-            'test_accuracy': accuracy,
+            'accuracy': float(accuracy),
             'conf_matrix': conf_matrix,
             'report': report,
             'entropy_per_class': entropy_per_class,
             'error_per_class': error_per_class
         })
-        
-    os.makedirs(csv_save_dir, exist_ok=True)
 
-    with open(os.path.join(csv_save_dir, f"{model_name}{condition}_layer_decoding.json"), "w") as f:
+    # Save final metrics
+    os.makedirs(csv_save_dir, exist_ok=True)
+    json_path = os.path.join(csv_save_dir, f"{model_name}{condition}_layer_decoding.json")
+    with open(json_path, "w") as f:
         json.dump(final_metrics, f, indent=4)
+
+    print(f"Metrics saved to {json_path}")
 
 
 def compute_tuning_curves(model, dataloader, layer, num_numerosities, layer_idx, plots_dir, csv_dir):
