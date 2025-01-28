@@ -24,6 +24,201 @@ from plot_utils import(
 
 device = torch.device('cuda')
 
+def compute_two_task_classification_metrics(
+    model,
+    test_loader,
+    num_object_classes,
+    num_numerosity_classes
+):
+    """
+    Evaluate a dual-output model (object classification + numerosity classification)
+    on a test DataLoader, computing classification metrics for each task.
+
+    The DataLoader is assumed to yield (inputs, object_labels, numerosity_labels).
+    
+    Args:
+        model (torch.nn.Module): A model that returns two outputs:
+            (object_logits, numerosity_logits).
+        test_loader (DataLoader): DataLoader providing test samples.
+        device (torch.device): Torch device (cpu/cuda).
+        num_object_classes (int): Number of classes for the object classification.
+        num_numerosity_classes (int): Number of classes for the numerosity classification.
+        numerosity_mapping (dict or list): Maps numerosity class index -> actual numerosity.
+    
+    Returns:
+        dict: A dictionary containing classification metrics for both tasks,
+              keyed as "object_metrics" and "numerosity_metrics".
+    """
+    
+    numerosity_mapping = {
+        0: 1, 1: 2, 2: 4, 3: 6, 4: 8, 5: 10, 6: 12, 7: 14,
+        8: 16, 9: 18, 10: 20, 11: 22, 12: 24, 13: 26, 14: 28, 15: 30
+    }
+
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    model.to(device)
+    model.eval()
+
+    # Prepare accumulators for object classification
+    obj_predictions = []
+    obj_softmax_outputs = []
+    obj_val_labels = []
+
+    # Prepare accumulators for numerosity classification
+    num_predictions = []
+    num_softmax_outputs = []
+    num_val_labels = []
+
+    # --------------------------------------------------------------------
+    # 1) Evaluate model on the test set
+    # --------------------------------------------------------------------
+    with torch.no_grad():
+        for inputs, obj_labels, num_labels in tqdm(test_loader):
+            inputs = inputs.to(device)
+            # Move labels to CPU-compatible format (only if needed on GPU for something else)
+            obj_labels = obj_labels.numpy()
+            num_labels = num_labels.numpy()
+
+            # Forward pass through your dual-output model
+            # The model should return two separate logits: object_logits, numerosity_logits
+            object_logits, numerosity_logits = model(inputs)
+
+            # 1a) Object classification
+            object_preds = torch.argmax(object_logits, dim=1).cpu().numpy()
+            obj_predictions.extend(object_preds)
+
+            object_softmax = torch.softmax(object_logits, dim=1).cpu().numpy()
+            obj_softmax_outputs.extend(object_softmax)
+
+            # 1b) Numerosity classification
+            numerosity_preds = torch.argmax(numerosity_logits, dim=1).cpu().numpy()
+            num_predictions.extend(numerosity_preds)
+
+            numerosity_softmax = torch.softmax(numerosity_logits, dim=1).cpu().numpy()
+            num_softmax_outputs.extend(numerosity_softmax)
+
+            # 1c) Save the ground-truth labels
+            obj_val_labels.extend(obj_labels)
+            num_val_labels.extend(num_labels)
+
+    # Convert to numpy arrays for consistent processing
+    obj_predictions = np.array(obj_predictions)
+    obj_softmax_outputs = np.array(obj_softmax_outputs)
+    obj_val_labels = np.array(obj_val_labels)
+
+    num_predictions = np.array(num_predictions)
+    num_softmax_outputs = np.array(num_softmax_outputs)
+    num_val_labels = np.array(num_val_labels)
+
+    # --------------------------------------------------------------------
+    # 2) Object classification metrics
+    # --------------------------------------------------------------------
+    obj_accuracy = accuracy_score(obj_val_labels, obj_predictions)
+    obj_conf_matrix = confusion_matrix(obj_val_labels, obj_predictions).tolist()
+    obj_report = classification_report(
+        obj_val_labels,
+        obj_predictions,
+        target_names=[f"Object Class {i}" for i in range(num_object_classes)],
+        output_dict=True
+    )
+
+    # Per-class entropy for object classification
+    obj_entropy_per_class = {}
+    for c in range(num_object_classes):
+        mask_c = (obj_val_labels == c)
+        class_probs = obj_softmax_outputs[mask_c]
+        if len(class_probs) > 0:
+            ent = [entropy(prob) for prob in class_probs]
+            obj_entropy_per_class[f"Class {c}"] = float(np.mean(ent))
+        else:
+            obj_entropy_per_class[f"Class {c}"] = None
+
+    # Combine object classification metrics
+    object_metrics = {
+        "accuracy": float(obj_accuracy),
+        "conf_matrix": obj_conf_matrix,
+        "class_report": obj_report,
+        "entropy_per_class": obj_entropy_per_class
+    }
+
+    # --------------------------------------------------------------------
+    # 3) Numerosity classification metrics
+    # --------------------------------------------------------------------
+    num_accuracy = accuracy_score(num_val_labels, num_predictions)
+    num_conf_matrix = confusion_matrix(num_val_labels, num_predictions).tolist()
+    num_report = classification_report(
+        num_val_labels,
+        num_predictions,
+        target_names=[f"Numerosity Class {i}" for i in range(num_numerosity_classes)],
+        output_dict=True
+    )
+
+    # Per-class entropy for numerosity classification
+    num_entropy_per_class = {}
+    for c in range(num_numerosity_classes):
+        mask_c = (num_val_labels == c)
+        class_probs = num_softmax_outputs[mask_c]
+        if len(class_probs) > 0:
+            ent = [entropy(prob) for prob in class_probs]
+            num_entropy_per_class[f"Class {c}"] = float(np.mean(ent))
+        else:
+            num_entropy_per_class[f"Class {c}"] = None
+
+    # (Optional) Average error distance per class (ignoring correct predictions)
+    # This is only meaningful if `numerosity_mapping` is relevant to your task
+    num_error_per_class = {}
+    for c in range(num_numerosity_classes):
+        mask_c = (num_val_labels == c)
+        # Among these, consider only misclassifications
+        incorrect_mask = (num_predictions != num_val_labels) & mask_c
+        predicted_labels_for_class = num_predictions[incorrect_mask]
+        true_numerosity = numerosity_mapping[c]
+
+        if len(predicted_labels_for_class) > 0:
+            predicted_numerosities = [numerosity_mapping[p] for p in predicted_labels_for_class]
+            absolute_errors = [abs(pred - true_numerosity) for pred in predicted_numerosities]
+            avg_error = float(np.mean(absolute_errors))
+            num_error_per_class[f"Class {c}"] = avg_error
+        else:
+            num_error_per_class[f"Class {c}"] = None
+
+    # (Optional) MAE per class
+    num_mae_per_class = {}
+    for c in range(num_numerosity_classes):
+        mask_c = (num_val_labels == c)
+        predictions_for_class = num_predictions[mask_c]
+        true_numerosity = numerosity_mapping[c]
+
+        if len(predictions_for_class) > 0:
+            predicted_numerosities = [numerosity_mapping[p] for p in predictions_for_class]
+            ae = [abs(pred - true_numerosity) for pred in predicted_numerosities]
+            mae = float(np.mean(ae))
+            num_mae_per_class[f"Class {c}"] = mae
+        else:
+            num_mae_per_class[f"Class {c}"] = None
+
+    # Combine numerosity classification metrics
+    numerosity_metrics = {
+        "accuracy": float(num_accuracy),
+        "conf_matrix": num_conf_matrix,
+        "class_report": num_report,
+        "entropy_per_class": num_entropy_per_class,
+        "error_per_class": num_error_per_class,    # Optional
+        "mae_per_class": num_mae_per_class         # Optional
+    }
+
+    # --------------------------------------------------------------------
+    # 4) Final dictionary: object + numerosity
+    # --------------------------------------------------------------------
+    final_metrics = {
+        "object_metrics": object_metrics,
+        "numerosity_metrics": numerosity_metrics
+    }
+
+    return final_metrics
+
 # Function to get softmax values and corresponding ground truth labels
 def get_softmax_values_and_ground_truth(model, test_loader):
     num_softmax = []
