@@ -25,10 +25,29 @@ class MultiTaskDataset(Dataset):
         print(f"Size of CSV dataset: {len(self.annotations)} rows")
 
         # Create label-to-index mappings for class1
-        self.class1_labels = self.annotations.iloc[:, 1].unique()
-        self.class1_mapping = {label: idx for idx, label in enumerate(self.class1_labels)}
+        self.class1_mapping = {'cleaning_snuggle_henkel': 0, 
+                               'drink_greentea_itoen': 1, 
+                               'F_Europe_Hotdog_Hotdog_Classic': 2, 
+                               'F_Latin_Taco_Classic': 3, 
+                               'drink_whippingcream_lucerne': 4, 
+                               'F_Europe_Bakery_Donut_Chocolate': 5, 
+                               'cereal_cheerios_honeynut': 6, 
+                               'F_Asia_Takoyaki_Small': 7, 
+                               'F_Europe_Burger_Hamburger': 8, 
+                               'F_Europe_Pizza_Pepperoni': 9, 
+                               'HamEgg': 0, 
+                               'banana': 1, 
+                               'acorn': 2, 
+                               'garlic': 3, 
+                               'Cake': 4, 
+                               'icecream': 5, 
+                               'grape': 6, 
+                               'pea': 7, 
+                               'watermelon': 8, 
+                               'craft_yarn_caron_01': 9}
+        
         print(f"Class 1 mapping: {self.class1_mapping}")
-
+        
         # Numerosity classes for task2
         self.numerosity_classes = [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30]
         self.class2_mapping = {num: idx for idx, num in enumerate(self.numerosity_classes)}
